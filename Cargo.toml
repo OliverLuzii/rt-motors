@@ -1,11 +1,11 @@
 [package]
 edition      = "2024"
-name         = "acker-control"
+name         = "rt-motors"
 rust-version = "1.88"
 version      = "0.1.0"
 
 [[bin]]
-name = "acker-control"
+name = "rt-motors"
 path = "./src/bin/main.rs"
 
 [dependencies]
