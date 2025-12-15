@@ -36,21 +36,23 @@ const MOTOR_WATCH_SIZE: usize = 2;
 
 const UART_RBUF_SIZE: usize = 8;
 
-const ENCODER_TIMEOUT_MICROS: u64 = 100_000;
+const ENCODER_TIMEOUT_MICROS: u64 = 50_000;
 const POSEDGE_HZ_RATIO: f32 = 6.4634;
 const GEAR_REDUCTION: f32 = 1.0 / 100.0;
 
-const PWM_PERIOD: u16 = 1000;
-const RPM_BUFFER_SIZE: usize = 3;
-const K_P: f32 = 0.008 * PWM_PERIOD as f32;
-const K_I: f32 = 0.001 * PWM_PERIOD as f32;
+const PWM_PERIOD: u16 = 3000;
+const RPM_BUFFER_SIZE: usize = 6;
+const DEADZONE: f32 = 3.0;
+const K_P: f32 = 0.015 * PWM_PERIOD as f32;
+const K_I: f32 = 0.02 * PWM_PERIOD as f32;
 
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct MotorState {
     fall: Option<embassy_time::Instant>,
     rise: Option<embassy_time::Instant>,
     positive_edge: Option<embassy_time::Duration>,
     hall_state: u8,
+    speed_buffer: CircularBuffer<RPM_BUFFER_SIZE, f32>
 }
 
 impl MotorState {
@@ -87,6 +89,17 @@ impl MotorState {
                 * GEAR_REDUCTION
                 * direction,
         );
+    }
+
+    fn get_speed(&self) -> f32 {
+        self.speed_buffer.iter().sum::<f32>() / RPM_BUFFER_SIZE as f32
+    }
+
+    fn add_to_buffer(&mut self, speed: Option<f32>) {
+        match speed {
+            Some(spd) => {self.speed_buffer.push_back(spd);},
+            None => {}
+        }
     }
 }
 
@@ -190,15 +203,13 @@ async fn rpm_interrupt(
         }
         .or(motor_state.positive_edge);
 
-        let new_state = MotorState {
-            fall: fall,
-            rise: rise,
-            positive_edge: positive_edge,
-            hall_state: 0b1111 & (motor_state.hall_state << 2 | hall_state),
-        };
+        motor_state.fall = fall;
+        motor_state.rise = rise;
+        motor_state.positive_edge = positive_edge;
+        motor_state.hall_state = 0b1111 & (motor_state.hall_state << 2 | hall_state);
+        motor_state.add_to_buffer(motor_state.get_speed_reading());
 
-        motor_sender.send(new_state.get_speed_reading());
-        motor_state = new_state;
+        motor_sender.send(Some(motor_state.get_speed()));
     }
 }
 
@@ -230,8 +241,8 @@ async fn pid_controller(
     mcpwm.timer0.start(timer_clock_cfg.clone());
     mcpwm.timer1.start(timer_clock_cfg.clone());
 
-    let mut rpm_buffer = CircularBuffer::<RPM_BUFFER_SIZE, f32>::from([0.0, 0.0, 0.0]);
     let mut reference_rpm = 0f32;
+    let mut motor_rpm = 0f32;
 
     let mut accum_error = 0f32;
     let mut previous_time = embassy_time::Instant::now();
@@ -248,23 +259,25 @@ async fn pid_controller(
                     reference_rpm = rpm;
                 }
             }
-            Either::Second(motor_rpm) => {
-                if let Some(rpm) = motor_rpm {
-                    rpm_buffer.push_back(rpm);
+            Either::Second(m_rpm) => {
+                if let Some(rpm) = m_rpm {
+                    motor_rpm = rpm;
                 }
             }
         };
 
-        let motor_rpm = rpm_buffer.iter().sum::<f32>() / RPM_BUFFER_SIZE as f32;
-
         let error = reference_rpm - motor_rpm;
         let delta = embassy_time::Instant::now() - previous_time;
 
-        accum_error += error * (delta.as_micros() as f32 * MICROS_TO_SECS);
-
-        if accum_error * error <= 0.0 {
-           accum_error = 0.0; 
+        if reference_rpm.abs() > DEADZONE {
+            accum_error += error * (delta.as_micros() as f32 * MICROS_TO_SECS);
+        } else {
+            accum_error = 0.0;
         }
+
+        // if accum_error * error <= 0.0 {
+        //    accum_error = 0.0; 
+        // }
 
         let control =
             (K_P * error + K_I * accum_error).clamp(-(PWM_PERIOD as f32), PWM_PERIOD as f32);
@@ -283,7 +296,7 @@ async fn pid_controller(
             }
         }
 
-        log::info!("Control signal applied: {} from {}", libm::roundf(control.abs()) as u16, PWM_PERIOD);
+        // log::info!("Control signal applied: {} from {}", libm::roundf(control.abs()) as u16, PWM_PERIOD);
         previous_time = embassy_time::Instant::now();
     }
 }
