@@ -112,7 +112,7 @@ async fn uart_reader(
                     offset = 0;
                 }
             }
-            _ => continue,
+            _ => {},
         };
 
         if !rbuf.contains(&NEWLINE) {
@@ -254,11 +254,6 @@ async fn pid_controller(
                 }
             }
         };
-
-        // log::info!(
-        //     "PID controller activated, current time: {}",
-        //     embassy_time::Instant::now()
-        // );
 
         let motor_rpm = rpm_buffer.iter().sum::<f32>() / RPM_BUFFER_SIZE as f32;
 
