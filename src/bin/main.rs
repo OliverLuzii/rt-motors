@@ -42,7 +42,7 @@ const GEAR_REDUCTION: f32 = 1.0 / 100.0;
 
 const PWM_PERIOD: u16 = 3000;
 const RPM_BUFFER_SIZE: usize = 6;
-const DEADZONE: f32 = 3.0;
+const RPM_DEADZONE: f32 = 3.0;
 const K_P: f32 = 0.015 * PWM_PERIOD as f32;
 const K_I: f32 = 0.02 * PWM_PERIOD as f32;
 
@@ -165,19 +165,19 @@ async fn rpm_interrupt(
     let h2 = Input::new(h2_pin, input_config);
 
     let mut motor_state = MotorState::default();
-
     let motor_sender = motor_watch.sender();
 
     loop {
         xor.wait_for_any_edge().await;
+        let time = embassy_time::Instant::now();
 
         let xor_level = xor.level();
         let h1_level = h1.level();
         let h2_level = h2.level();
 
         let (fall, rise) = match xor_level {
-            Level::Low => (Some(embassy_time::Instant::now()), None),
-            Level::High => (None, Some(embassy_time::Instant::now())),
+            Level::Low => (Some(time), None),
+            Level::High => (None, Some(time)),
         };
 
         let hall_state = match (h1_level, h2_level) {
@@ -269,7 +269,7 @@ async fn pid_controller(
         let error = reference_rpm - motor_rpm;
         let delta = embassy_time::Instant::now() - previous_time;
 
-        if reference_rpm.abs() > DEADZONE {
+        if reference_rpm.abs() > RPM_DEADZONE {
             accum_error += error * (delta.as_micros() as f32 * MICROS_TO_SECS);
         } else {
             accum_error = 0.0;
