@@ -3,11 +3,10 @@
 #![feature(ascii_char)]
 
 use esp_backtrace as _;
-use circular_buffer::CircularBuffer;
 use static_cell::StaticCell;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either};
+use embassy_futures::select::Either;
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::watch::Watch;
 use esp_hal::Async;
@@ -36,70 +35,55 @@ const MOTOR_WATCH_SIZE: usize = 2;
 
 const UART_RBUF_SIZE: usize = 8;
 
-const ENCODER_TIMEOUT_MICROS: u64 = 50_000;
-const POSEDGE_HZ_RATIO: f32 = 6.4634;
 const GEAR_REDUCTION: f32 = 1.0 / 100.0;
+const ALPHA: f32 = 0.8;
 
 const PWM_PERIOD: u16 = 3000;
-const RPM_BUFFER_SIZE: usize = 6;
 const RPM_DEADZONE: f32 = 3.0;
-const K_P: f32 = 0.015 * PWM_PERIOD as f32;
+const K_P: f32 = 0.0 * PWM_PERIOD as f32;
 const K_I: f32 = 0.02 * PWM_PERIOD as f32;
+
+#[derive(Debug, Default, Clone, Copy)]
+enum Direction {
+    #[default]
+    AntiClockwise,
+    Clockwise,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct MotorState {
     fall: Option<embassy_time::Instant>,
     rise: Option<embassy_time::Instant>,
-    positive_edge: Option<embassy_time::Duration>,
-    hall_state: u8,
-    speed_buffer: CircularBuffer<RPM_BUFFER_SIZE, f32>
+    direction: Direction,
+    filtered_speed: f32,
 }
 
 impl MotorState {
-    // Gives unstable readings due to sensor innacuracies, filtering necessary.
-    fn get_speed_reading(&self) -> Option<f32> {
-        let (fall, rise, pos_edge) = match (self.fall, self.rise, self.positive_edge) {
-            (Some(f), Some(r), Some(p_e)) => (f, r, p_e),
+    // Function mutates due to low-pass filtering altering the MotorState struct.
+    fn get_speed(&mut self) -> Option<f32> {
+        let (fall, rise) = match (self.fall, self.rise) {
+            (Some(f), Some(r)) => (f, r),
             _ => return None,
         };
 
-        let direction: f32 = match self.hall_state {
-            0b0010 | 0b1011 | 0b1101 | 0b0100 => 1.0,
-            0b0001 | 0b0111 | 0b1110 | 0b1000 => -1.0,
-            _ => {
-                log::warn!("Invalid state transition for motor.");
-                return None;
-            }
+        let direction_mul = match self.direction {
+            Direction::AntiClockwise => 1.0,
+            Direction::Clockwise => -1.0,
         };
 
-        let instant = embassy_time::Instant::now();
+        let edge_duration = if fall > rise {
+            fall - rise
+        } else {
+            rise - fall
+        };
 
-        let rise_delta = instant - rise;
-        let fall_delta = instant - fall;
+        let speed_reading = (1.0 / ((edge_duration.as_micros() as f32 * MICROS_TO_SECS) * 2.0))
+            * HZ_TO_RPM
+            * GEAR_REDUCTION
+            * direction_mul;
 
-        if rise_delta.as_micros() >= ENCODER_TIMEOUT_MICROS
-            || fall_delta.as_micros() >= ENCODER_TIMEOUT_MICROS
-        {
-            return Some(0.0);
-        }
-
-        return Some(
-            (1.0 / ((pos_edge.as_micros() as f32 * MICROS_TO_SECS) * POSEDGE_HZ_RATIO))
-                * HZ_TO_RPM
-                * GEAR_REDUCTION
-                * direction,
-        );
-    }
-
-    fn get_speed(&self) -> f32 {
-        self.speed_buffer.iter().sum::<f32>() / RPM_BUFFER_SIZE as f32
-    }
-
-    fn add_to_buffer(&mut self, speed: Option<f32>) {
-        match speed {
-            Some(spd) => {self.speed_buffer.push_back(spd);},
-            None => {}
-        }
+        self.filtered_speed = (ALPHA * speed_reading) + (1.0 - ALPHA) * self.filtered_speed;
+        return Some(self.filtered_speed);
     }
 }
 
@@ -125,7 +109,7 @@ async fn uart_reader(
                     offset = 0;
                 }
             }
-            _ => {},
+            _ => {}
         };
 
         if !rbuf.contains(&NEWLINE) {
@@ -153,63 +137,46 @@ async fn uart_reader(
 
 #[embassy_executor::task(pool_size = 2)]
 async fn rpm_interrupt(
-    xor_pin: AnyPin<'static>,
     h1_pin: AnyPin<'static>,
     h2_pin: AnyPin<'static>,
     motor_watch: &'static Watch<CriticalSectionRawMutex, Option<f32>, MOTOR_WATCH_SIZE>,
 ) {
     let input_config = esp_hal::gpio::InputConfig::default();
 
-    let mut xor = Input::new(xor_pin, input_config);
-    let h1 = Input::new(h1_pin, input_config);
+    let mut h1 = Input::new(h1_pin, input_config);
     let h2 = Input::new(h2_pin, input_config);
 
     let mut motor_state = MotorState::default();
     let motor_sender = motor_watch.sender();
 
     loop {
-        xor.wait_for_any_edge().await;
+        h1.wait_for_any_edge().await;
         let time = embassy_time::Instant::now();
 
-        let xor_level = xor.level();
         let h1_level = h1.level();
         let h2_level = h2.level();
 
-        let (fall, rise) = match xor_level {
+        let (fall, rise) = match h1_level {
             Level::Low => (Some(time), None),
             Level::High => (None, Some(time)),
-        };
-
-        let hall_state = match (h1_level, h2_level) {
-            (Level::Low, Level::Low) => 0b00,
-            (Level::High, Level::Low) => 0b10,
-            (Level::High, Level::High) => 0b11,
-            (Level::Low, Level::High) => 0b01,
         };
 
         let fall = fall.or(motor_state.fall);
         let rise = rise.or(motor_state.rise);
 
-        let positive_edge = match (fall, rise) {
-            (Some(f), Some(r)) => {
-                if f > r {
-                    Some(f - r)
-                } else {
-                    None
-                }
-            }
-
-            _ => None,
-        }
-        .or(motor_state.positive_edge);
+        let direction = if h1_level != h2_level {
+            Direction::AntiClockwise
+        } else {
+            Direction::Clockwise
+        };
 
         motor_state.fall = fall;
         motor_state.rise = rise;
-        motor_state.positive_edge = positive_edge;
-        motor_state.hall_state = 0b1111 & (motor_state.hall_state << 2 | hall_state);
-        motor_state.add_to_buffer(motor_state.get_speed_reading());
+        motor_state.direction = direction;
 
-        motor_sender.send(Some(motor_state.get_speed()));
+        let speed = motor_state.get_speed();
+
+        motor_sender.send(speed);
     }
 }
 
@@ -275,10 +242,6 @@ async fn pid_controller(
             accum_error = 0.0;
         }
 
-        // if accum_error * error <= 0.0 {
-        //    accum_error = 0.0; 
-        // }
-
         let control =
             (K_P * error + K_I * accum_error).clamp(-(PWM_PERIOD as f32), PWM_PERIOD as f32);
 
@@ -296,7 +259,6 @@ async fn pid_controller(
             }
         }
 
-        // log::info!("Control signal applied: {} from {}", libm::roundf(control.abs()) as u16, PWM_PERIOD);
         previous_time = embassy_time::Instant::now();
     }
 }
@@ -345,7 +307,6 @@ async fn main(spawner: Spawner) -> ! {
     interrupt_spawner.must_spawn(rpm_interrupt(
         peripherals.GPIO4.into(),
         peripherals.GPIO16.into(),
-        peripherals.GPIO17.into(),
         lm_watch,
     ));
     log::info!("RPM sensor initialized.");
@@ -358,7 +319,7 @@ async fn main(spawner: Spawner) -> ! {
         lm_watch,
     ));
     log::info!("PID controller initialized.\n");
-    
+
     let mut input_receiver = input_watch.receiver().unwrap();
     let mut lm_receiver = lm_watch.receiver().unwrap();
 
