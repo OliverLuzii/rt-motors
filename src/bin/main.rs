@@ -6,7 +6,7 @@ use esp_backtrace as _;
 use static_cell::StaticCell;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::Either;
+use embassy_futures::select::{Either};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::watch::Watch;
 use esp_hal::Async;
@@ -19,6 +19,7 @@ use esp_hal::mcpwm::operator::PwmPinConfig;
 use esp_hal::mcpwm::timer::PwmWorkingMode;
 use esp_hal::mcpwm::{McPwm, PeripheralClockConfig};
 use esp_hal::peripherals::MCPWM0;
+use esp_hal::time::Instant;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{RxConfig, Uart, UartRx};
@@ -36,12 +37,13 @@ const MOTOR_WATCH_SIZE: usize = 2;
 const UART_RBUF_SIZE: usize = 8;
 
 const GEAR_REDUCTION: f32 = 1.0 / 100.0;
-const ALPHA: f32 = 0.8;
+const ALPHA: f32 = 0.1;
+
+const ENCODER_TIMEOUT_MILLIS: u64 = 50;
 
 const PWM_PERIOD: u16 = 3000;
-const RPM_DEADZONE: f32 = 3.0;
-const K_P: f32 = 0.0 * PWM_PERIOD as f32;
-const K_I: f32 = 0.02 * PWM_PERIOD as f32;
+const K_P: f32 = 0.08 * PWM_PERIOD as f32;
+const K_I: f32 = 0.04 * PWM_PERIOD as f32;
 
 #[derive(Debug, Default, Clone, Copy)]
 enum Direction {
@@ -52,14 +54,14 @@ enum Direction {
 
 #[derive(Debug, Default, Clone)]
 pub struct MotorState {
-    fall: Option<embassy_time::Instant>,
-    rise: Option<embassy_time::Instant>,
+    fall: Option<Instant>,
+    rise: Option<Instant>,
     direction: Direction,
-    filtered_speed: f32,
+    filter: f32,
 }
 
 impl MotorState {
-    // Function mutates due to low-pass filtering altering the MotorState struct.
+    // Mutates due to first order low-pass filter.
     fn get_speed(&mut self) -> Option<f32> {
         let (fall, rise) = match (self.fall, self.rise) {
             (Some(f), Some(r)) => (f, r),
@@ -77,13 +79,25 @@ impl MotorState {
             rise - fall
         };
 
-        let speed_reading = (1.0 / ((edge_duration.as_micros() as f32 * MICROS_TO_SECS) * 2.0))
-            * HZ_TO_RPM
-            * GEAR_REDUCTION
-            * direction_mul;
+        let now_delta = esp_hal::time::Instant::now() - fall.max(rise);
 
-        self.filtered_speed = (ALPHA * speed_reading) + (1.0 - ALPHA) * self.filtered_speed;
-        return Some(self.filtered_speed);
+        let duration = if now_delta < edge_duration {
+            edge_duration
+        } else {
+            now_delta
+        };
+
+        if duration.as_millis() > 200 {
+            return Some(0.0);
+        }
+
+        let speed_reading = (1.0 / ((duration.as_micros() as f32 * MICROS_TO_SECS) * 2.0))
+                * HZ_TO_RPM
+                * GEAR_REDUCTION
+                * direction_mul;
+
+        self.filter = (ALPHA * speed_reading) + (1.0 - ALPHA) * self.filter;
+        return Some(self.filter);
     }
 }
 
@@ -149,33 +163,43 @@ async fn rpm_interrupt(
     let mut motor_state = MotorState::default();
     let motor_sender = motor_watch.sender();
 
+    let mut fall: Option<Instant>;
+    let mut rise: Option<Instant>;
+
     loop {
-        h1.wait_for_any_edge().await;
-        let time = embassy_time::Instant::now();
+        match embassy_futures::select::select(
+            h1.wait_for_any_edge(),
+            embassy_time::Timer::after_millis(ENCODER_TIMEOUT_MILLIS),
+        )
+        .await
+        {
+            Either::First(_) => {
+                let time = Instant::now();
+                let h1_level = h1.level();
+                let h2_level = h2.level();
 
-        let h1_level = h1.level();
-        let h2_level = h2.level();
+                (fall, rise) = match h1_level {
+                    Level::Low => (Some(time), None),
+                    Level::High => (None, Some(time)),
+                };
 
-        let (fall, rise) = match h1_level {
-            Level::Low => (Some(time), None),
-            Level::High => (None, Some(time)),
+                let fall = fall.or(motor_state.fall);
+                let rise = rise.or(motor_state.rise);
+
+                let direction = if h1_level != h2_level {
+                    Direction::AntiClockwise
+                } else {
+                    Direction::Clockwise
+                };
+
+                motor_state.fall = fall;
+                motor_state.rise = rise;
+                motor_state.direction = direction;
+            }
+            Either::Second(_) => {}
         };
-
-        let fall = fall.or(motor_state.fall);
-        let rise = rise.or(motor_state.rise);
-
-        let direction = if h1_level != h2_level {
-            Direction::AntiClockwise
-        } else {
-            Direction::Clockwise
-        };
-
-        motor_state.fall = fall;
-        motor_state.rise = rise;
-        motor_state.direction = direction;
 
         let speed = motor_state.get_speed();
-
         motor_sender.send(speed);
     }
 }
@@ -192,21 +216,18 @@ async fn pid_controller(
     let mut mcpwm = McPwm::new(mcpwm, clock_cfg);
 
     mcpwm.operator0.set_timer(&mcpwm.timer0);
-    mcpwm.operator1.set_timer(&mcpwm.timer1);
-    let mut pin_a = mcpwm
-        .operator0
-        .with_pin_a(pin_a, PwmPinConfig::UP_ACTIVE_HIGH);
-
-    let mut pin_b = mcpwm
-        .operator1
-        .with_pin_b(pin_b, PwmPinConfig::UP_ACTIVE_HIGH);
+    let (mut pin_a, mut pin_b) = mcpwm.operator0.with_pins(
+        pin_a,
+        PwmPinConfig::UP_ACTIVE_HIGH,
+        pin_b,
+        PwmPinConfig::UP_ACTIVE_HIGH,
+    );
 
     let timer_clock_cfg = clock_cfg
-        .timer_clock_with_frequency(PWM_PERIOD - 1, PwmWorkingMode::Increase, Rate::from_khz(20))
+        .timer_clock_with_frequency(PWM_PERIOD - 1, PwmWorkingMode::Increase, Rate::from_khz(3))
         .unwrap();
 
-    mcpwm.timer0.start(timer_clock_cfg.clone());
-    mcpwm.timer1.start(timer_clock_cfg.clone());
+    mcpwm.timer0.start(timer_clock_cfg);
 
     let mut reference_rpm = 0f32;
     let mut motor_rpm = 0f32;
@@ -236,11 +257,12 @@ async fn pid_controller(
         let error = reference_rpm - motor_rpm;
         let delta = embassy_time::Instant::now() - previous_time;
 
-        if reference_rpm.abs() > RPM_DEADZONE {
-            accum_error += error * (delta.as_micros() as f32 * MICROS_TO_SECS);
-        } else {
-            accum_error = 0.0;
-        }
+        accum_error += error * (delta.as_micros() as f32 * MICROS_TO_SECS);
+        // if reference_rpm.abs() > RPM_DEADZONE {
+        //     accum_error += error * (delta.as_micros() as f32 * MICROS_TO_SECS);
+        // } else {
+        //     accum_error = 0.0;
+        // }
 
         let control =
             (K_P * error + K_I * accum_error).clamp(-(PWM_PERIOD as f32), PWM_PERIOD as f32);
@@ -254,6 +276,7 @@ async fn pid_controller(
                 pin_a.set_timestamp(0);
                 pin_b.set_timestamp(libm::roundf(control.abs()) as u16);
             }
+
             _ => {
                 log::warn!("Control signal isn't a number.");
             }
@@ -313,8 +336,8 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.must_spawn(pid_controller(
         peripherals.MCPWM0,
+        peripherals.GPIO21.into(),
         peripherals.GPIO22.into(),
-        peripherals.GPIO23.into(),
         input_watch,
         lm_watch,
     ));
@@ -326,7 +349,7 @@ async fn main(spawner: Spawner) -> ! {
     loop {
         let lm_poll = embassy_futures::join::join(
             lm_receiver.changed(),
-            embassy_time::Timer::after_millis(200),
+            embassy_time::Timer::after_millis(20),
         );
 
         match embassy_futures::select::select(input_receiver.changed(), lm_poll).await {
